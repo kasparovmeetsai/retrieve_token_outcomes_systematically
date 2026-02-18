@@ -41,9 +41,34 @@ python claim_polymarket_outcomes.py --conditions-file conditions.json
 
 If `index_sets` is omitted, the script will auto-redeem all outcomes for that condition based on `getOutcomeSlotCount`.
 
+## About defaults (important)
+
+Built-in addresses are **convenience presets**, not permanent guarantees.
+
+- The script auto-detects chain ID from your RPC.
+- If the chain has a known preset (currently Polygon mainnet), that preset is used.
+- If not, you **must** provide addresses via flags/env vars.
+- The script validates that contract bytecode exists at both addresses before running.
+
+Override addresses if needed:
+
+```bash
+export POLYMARKET_CTF_ADDRESS=0x...
+export POLYMARKET_COLLATERAL_TOKEN=0x...
+python claim_polymarket_outcomes.py --conditions-file conditions.json --dry-run
+```
+
+Or via CLI:
+
+```bash
+python claim_polymarket_outcomes.py \
+  --ctf-address 0x... \
+  --collateral-token 0x... \
+  --condition-id 0x... \
+  --dry-run
+```
+
 ## Notes
 
-- Default network is Polygon (chain ID 137).
-- Default collateral token is Polygon USDC.e (`0x2791...4174`).
 - Only resolved conditions are redeemed (`payoutDenominator > 0`).
 - Always run `--dry-run` first when testing a new condition list.

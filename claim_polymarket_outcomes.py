@@ -18,11 +18,17 @@ from typing import Iterable, Sequence
 from web3 import Web3
 from web3.contract import Contract
 
-# Polygon mainnet defaults used by Polymarket.
 DEFAULT_RPC_URL = "https://polygon-rpc.com"
-DEFAULT_COLLATERAL_TOKEN = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e
-DEFAULT_CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-DEFAULT_CHAIN_ID = 137
+
+# These are known-good presets at the time this script was written.
+# You can always override with flags/environment if Polymarket updates addresses.
+KNOWN_NETWORK_DEFAULTS: dict[int, dict[str, str]] = {
+    137: {
+        "name": "polygon-mainnet",
+        "ctf": "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
+        "collateral": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",  # USDC.e
+    }
+}
 
 CTF_ABI = [
     {
@@ -60,6 +66,14 @@ class ConditionRedeemRequest:
     index_sets: list[int]
 
 
+@dataclass
+class ResolvedConfig:
+    chain_id: int
+    chain_name: str
+    ctf_address: str
+    collateral_token: str
+
+
 def _ensure_0x_hex(raw: str, expected_bytes: int, label: str) -> str:
     raw = raw.strip()
     if not raw.startswith("0x"):
@@ -89,13 +103,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ctf-address",
-        default=DEFAULT_CTF_ADDRESS,
-        help="Conditional Tokens contract address (default: %(default)s)",
+        default=os.getenv("POLYMARKET_CTF_ADDRESS"),
+        help="Conditional Tokens contract address (or set POLYMARKET_CTF_ADDRESS)",
     )
     parser.add_argument(
         "--collateral-token",
-        default=DEFAULT_COLLATERAL_TOKEN,
-        help="Collateral token address (Polymarket USDC by default)",
+        default=os.getenv("POLYMARKET_COLLATERAL_TOKEN"),
+        help="Collateral token address (or set POLYMARKET_COLLATERAL_TOKEN)",
     )
     parser.add_argument(
         "--condition-id",
@@ -120,8 +134,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--chain-id",
         type=int,
-        default=DEFAULT_CHAIN_ID,
-        help="Chain ID for signing (default: %(default)s)",
+        help=(
+            "Chain ID for signing. If omitted, uses connected RPC chain. "
+            "If provided, it must match the RPC chain."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -129,6 +145,45 @@ def parse_args() -> argparse.Namespace:
         help="Show what would be redeemed without sending transactions.",
     )
     return parser.parse_args()
+
+
+def resolve_config(args: argparse.Namespace, w3: Web3) -> ResolvedConfig:
+    rpc_chain_id = w3.eth.chain_id
+    chain_id = args.chain_id if args.chain_id is not None else rpc_chain_id
+    if chain_id != rpc_chain_id:
+        raise ValueError(
+            f"--chain-id ({chain_id}) does not match RPC chain ({rpc_chain_id}). "
+            "Use the correct RPC or remove --chain-id."
+        )
+
+    network_defaults = KNOWN_NETWORK_DEFAULTS.get(chain_id)
+    chain_name = network_defaults["name"] if network_defaults else f"chain-{chain_id}"
+
+    ctf_raw = args.ctf_address or (network_defaults["ctf"] if network_defaults else None)
+    collateral_raw = args.collateral_token or (network_defaults["collateral"] if network_defaults else None)
+
+    if not ctf_raw or not collateral_raw:
+        raise ValueError(
+            f"No built-in defaults for chain {chain_id}. Provide --ctf-address and --collateral-token "
+            "(or POLYMARKET_CTF_ADDRESS / POLYMARKET_COLLATERAL_TOKEN)."
+        )
+
+    ctf_address = Web3.to_checksum_address(ctf_raw)
+    collateral_token = Web3.to_checksum_address(collateral_raw)
+
+    ctf_code = w3.eth.get_code(ctf_address)
+    collateral_code = w3.eth.get_code(collateral_token)
+    if len(ctf_code) == 0:
+        raise ValueError(f"No contract code found at CTF address {ctf_address} on chain {chain_id}")
+    if len(collateral_code) == 0:
+        raise ValueError(f"No contract code found at collateral token address {collateral_token} on chain {chain_id}")
+
+    return ResolvedConfig(
+        chain_id=chain_id,
+        chain_name=chain_name,
+        ctf_address=ctf_address,
+        collateral_token=collateral_token,
+    )
 
 
 def load_condition_requests(args: argparse.Namespace, ctf: Contract) -> list[ConditionRedeemRequest]:
@@ -212,9 +267,13 @@ def main() -> int:
         print(f"ERROR: failed to connect to RPC URL: {args.rpc_url}", file=sys.stderr)
         return 1
 
-    ctf_address = Web3.to_checksum_address(args.ctf_address)
-    collateral_token = Web3.to_checksum_address(args.collateral_token)
-    ctf = w3.eth.contract(address=ctf_address, abi=CTF_ABI)
+    try:
+        config = resolve_config(args, w3)
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    ctf = w3.eth.contract(address=config.ctf_address, abi=CTF_ABI)
 
     account = w3.eth.account.from_key(args.private_key)
     owner = account.address
@@ -226,8 +285,9 @@ def main() -> int:
         return 1
 
     print(f"Owner:          {owner}")
-    print(f"CTF:            {ctf_address}")
-    print(f"Collateral:     {collateral_token}")
+    print(f"Chain:          {config.chain_id} ({config.chain_name})")
+    print(f"CTF:            {config.ctf_address}")
+    print(f"Collateral:     {config.collateral_token}")
     print(f"Conditions:     {len(requests)}")
 
     if args.dry_run:
@@ -247,7 +307,7 @@ def main() -> int:
             continue
 
         fn = ctf.functions.redeemPositions(
-            collateral_token,
+            config.collateral_token,
             b"\x00" * 32,
             req.condition_id,
             req.index_sets,
@@ -273,7 +333,7 @@ def main() -> int:
             {
                 "from": owner,
                 "nonce": nonce,
-                "chainId": args.chain_id,
+                "chainId": config.chain_id,
                 "gas": gas_limit,
                 "maxFeePerGas": w3.eth.max_priority_fee + w3.eth.gas_price,
                 "maxPriorityFeePerGas": w3.eth.max_priority_fee,
