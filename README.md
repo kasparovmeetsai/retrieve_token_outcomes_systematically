@@ -68,6 +68,34 @@ python claim_polymarket_outcomes.py \
   --dry-run
 ```
 
+## RPC connectivity troubleshooting
+
+If you get `ERROR: failed to connect to RPC URL`, your endpoint is down/blocked/slow from your network.
+
+The script now tries multiple endpoints in order:
+
+1. `--rpc-url` (or `POLYGON_RPC_URL`)
+2. Any `--rpc-fallback-url` values
+3. Any `POLYGON_RPC_FALLBACK_URLS` CSV values
+4. Built-in public fallbacks
+
+Example:
+
+```bash
+python claim_polymarket_outcomes.py \
+  --rpc-url https://polygon-rpc.com \
+  --rpc-fallback-url https://rpc.ankr.com/polygon \
+  --rpc-fallback-url https://polygon.llamarpc.com \
+  --condition-id 0x... \
+  --dry-run
+```
+
+You can also tune timeout per endpoint:
+
+```bash
+python claim_polymarket_outcomes.py --rpc-timeout-seconds 20 --condition-id 0x... --dry-run
+```
+
 ## Notes
 
 - Only resolved conditions are redeemed (`payoutDenominator > 0`).

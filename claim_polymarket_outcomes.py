@@ -19,6 +19,10 @@ from web3 import Web3
 from web3.contract import Contract
 
 DEFAULT_RPC_URL = "https://polygon-rpc.com"
+FALLBACK_RPC_URLS = [
+    "https://rpc.ankr.com/polygon",
+    "https://polygon.llamarpc.com",
+]
 
 # These are known-good presets at the time this script was written.
 # You can always override with flags/environment if Polymarket updates addresses.
@@ -87,6 +91,12 @@ def _ensure_0x_hex(raw: str, expected_bytes: int, label: str) -> str:
     return Web3.to_hex(as_bytes)
 
 
+def _split_csv_urls(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Redeem resolved Polymarket outcomes through ConditionalTokens.redeemPositions"
@@ -94,7 +104,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rpc-url",
         default=os.getenv("POLYGON_RPC_URL", DEFAULT_RPC_URL),
-        help="Polygon RPC URL (default: %(default)s or POLYGON_RPC_URL env)",
+        help="Primary Polygon RPC URL (default: %(default)s or POLYGON_RPC_URL env)",
+    )
+    parser.add_argument(
+        "--rpc-fallback-url",
+        action="append",
+        default=_split_csv_urls(os.getenv("POLYGON_RPC_FALLBACK_URLS")),
+        help=(
+            "Fallback RPC URL if primary fails. Repeat flag for multiple values "
+            "or use POLYGON_RPC_FALLBACK_URLS as CSV."
+        ),
     )
     parser.add_argument(
         "--private-key",
@@ -140,11 +159,45 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--rpc-timeout-seconds",
+        type=int,
+        default=12,
+        help="HTTP timeout per RPC endpoint test (default: %(default)s)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what would be redeemed without sending transactions.",
     )
     return parser.parse_args()
+
+
+def _connect_web3(args: argparse.Namespace) -> tuple[Web3, str]:
+    rpc_candidates = [args.rpc_url, *args.rpc_fallback_url, *FALLBACK_RPC_URLS]
+
+    # Deduplicate while preserving order.
+    deduped_candidates: list[str] = []
+    for url in rpc_candidates:
+        if url and url not in deduped_candidates:
+            deduped_candidates.append(url)
+
+    errors: list[str] = []
+
+    for url in deduped_candidates:
+        try:
+            w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": args.rpc_timeout_seconds}))
+            if w3.is_connected():
+                return w3, url
+            errors.append(f"{url} -> not connected")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{url} -> {exc}")
+
+    err_details = "\n  - " + "\n  - ".join(errors) if errors else ""
+    raise ConnectionError(
+        "failed to connect to any RPC URL. Set --rpc-url or --rpc-fallback-url "
+        "(or POLYGON_RPC_URL / POLYGON_RPC_FALLBACK_URLS)."
+        f"{err_details}"
+    )
 
 
 def resolve_config(args: argparse.Namespace, w3: Web3) -> ResolvedConfig:
@@ -262,9 +315,10 @@ def main() -> int:
         print("ERROR: private key is required via --private-key or POLYMARKET_PRIVATE_KEY", file=sys.stderr)
         return 1
 
-    w3 = Web3(Web3.HTTPProvider(args.rpc_url))
-    if not w3.is_connected():
-        print(f"ERROR: failed to connect to RPC URL: {args.rpc_url}", file=sys.stderr)
+    try:
+        w3, selected_rpc_url = _connect_web3(args)
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
     try:
@@ -285,6 +339,7 @@ def main() -> int:
         return 1
 
     print(f"Owner:          {owner}")
+    print(f"RPC:            {selected_rpc_url}")
     print(f"Chain:          {config.chain_id} ({config.chain_name})")
     print(f"CTF:            {config.ctf_address}")
     print(f"Collateral:     {config.collateral_token}")
