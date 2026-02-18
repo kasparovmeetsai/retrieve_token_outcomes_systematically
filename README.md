@@ -70,30 +70,55 @@ python claim_polymarket_outcomes.py \
 
 ## RPC connectivity troubleshooting
 
-If you get `ERROR: failed to connect to RPC URL`, your endpoint is down/blocked/slow from your network.
+If you get `ERROR: failed to connect to any RPC URL`, the machine running the script cannot reach Polygon RPC endpoints (endpoint down, network block, proxy issue, or timeout).
 
-The script now tries multiple endpoints in order:
+The script tries endpoints in order:
 
 1. `--rpc-url` (or `POLYGON_RPC_URL`)
 2. Any `--rpc-fallback-url` values
 3. Any `POLYGON_RPC_FALLBACK_URLS` CSV values
 4. Built-in public fallbacks
 
-Example:
+### Option A: Use your own RPC provider
+
+Use a private provider URL (Alchemy, QuickNode, Chainstack, etc.):
 
 ```bash
 python claim_polymarket_outcomes.py \
-  --rpc-url https://polygon-rpc.com \
-  --rpc-fallback-url https://rpc.ankr.com/polygon \
-  --rpc-fallback-url https://polygon.llamarpc.com \
+  --rpc-url "https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY" \
   --condition-id 0x... \
   --dry-run
 ```
 
-You can also tune timeout per endpoint:
+### Option B: Force no proxy
+
+If your machine has `HTTP_PROXY`/`HTTPS_PROXY` env vars and they are blocking requests:
 
 ```bash
-python claim_polymarket_outcomes.py --rpc-timeout-seconds 20 --condition-id 0x... --dry-run
+python claim_polymarket_outcomes.py --rpc-no-proxy --condition-id 0x... --dry-run
+```
+
+### Option C: Set an explicit proxy for RPC
+
+```bash
+python claim_polymarket_outcomes.py \
+  --rpc-http-proxy http://127.0.0.1:7890 \
+  --rpc-https-proxy http://127.0.0.1:7890 \
+  --condition-id 0x... \
+  --dry-run
+```
+
+(Equivalent env vars: `POLYGON_RPC_HTTP_PROXY`, `POLYGON_RPC_HTTPS_PROXY`.)
+
+### Option D: Add more fallbacks and increase timeout
+
+```bash
+python claim_polymarket_outcomes.py \
+  --rpc-fallback-url https://polygon-bor-rpc.publicnode.com \
+  --rpc-fallback-url https://polygon.drpc.org \
+  --rpc-timeout-seconds 20 \
+  --condition-id 0x... \
+  --dry-run
 ```
 
 ## Notes

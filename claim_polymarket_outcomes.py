@@ -22,6 +22,9 @@ DEFAULT_RPC_URL = "https://polygon-rpc.com"
 FALLBACK_RPC_URLS = [
     "https://rpc.ankr.com/polygon",
     "https://polygon.llamarpc.com",
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://1rpc.io/matic",
+    "https://polygon.drpc.org",
 ]
 
 # These are known-good presets at the time this script was written.
@@ -116,6 +119,27 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--rpc-timeout-seconds",
+        type=int,
+        default=12,
+        help="HTTP timeout per RPC endpoint test (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--rpc-http-proxy",
+        default=os.getenv("POLYGON_RPC_HTTP_PROXY"),
+        help="Optional HTTP proxy URL for RPC calls (or POLYGON_RPC_HTTP_PROXY)",
+    )
+    parser.add_argument(
+        "--rpc-https-proxy",
+        default=os.getenv("POLYGON_RPC_HTTPS_PROXY"),
+        help="Optional HTTPS proxy URL for RPC calls (or POLYGON_RPC_HTTPS_PROXY)",
+    )
+    parser.add_argument(
+        "--rpc-no-proxy",
+        action="store_true",
+        help="Disable proxies for RPC calls, even if HTTP(S)_PROXY is set in your environment.",
+    )
+    parser.add_argument(
         "--private-key",
         default=os.getenv("POLYMARKET_PRIVATE_KEY"),
         help="Wallet private key (or set POLYMARKET_PRIVATE_KEY)",
@@ -159,17 +183,26 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--rpc-timeout-seconds",
-        type=int,
-        default=12,
-        help="HTTP timeout per RPC endpoint test (default: %(default)s)",
-    )
-    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what would be redeemed without sending transactions.",
     )
     return parser.parse_args()
+
+
+def _build_rpc_request_kwargs(args: argparse.Namespace) -> dict:
+    request_kwargs: dict = {"timeout": args.rpc_timeout_seconds}
+
+    if args.rpc_no_proxy:
+        # Explicitly bypass environment proxies.
+        request_kwargs["proxies"] = {"http": "", "https": ""}
+    elif args.rpc_http_proxy or args.rpc_https_proxy:
+        request_kwargs["proxies"] = {
+            "http": args.rpc_http_proxy or "",
+            "https": args.rpc_https_proxy or args.rpc_http_proxy or "",
+        }
+
+    return request_kwargs
 
 
 def _connect_web3(args: argparse.Namespace) -> tuple[Web3, str]:
@@ -181,21 +214,24 @@ def _connect_web3(args: argparse.Namespace) -> tuple[Web3, str]:
         if url and url not in deduped_candidates:
             deduped_candidates.append(url)
 
+    request_kwargs = _build_rpc_request_kwargs(args)
     errors: list[str] = []
 
     for url in deduped_candidates:
         try:
-            w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": args.rpc_timeout_seconds}))
-            if w3.is_connected():
+            w3 = Web3(Web3.HTTPProvider(url, request_kwargs=request_kwargs))
+            chain_id = w3.eth.chain_id
+            if isinstance(chain_id, int) and chain_id > 0:
                 return w3, url
-            errors.append(f"{url} -> not connected")
+            errors.append(f"{url} -> chain_id unavailable")
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{url} -> {exc}")
 
     err_details = "\n  - " + "\n  - ".join(errors) if errors else ""
     raise ConnectionError(
-        "failed to connect to any RPC URL. Set --rpc-url or --rpc-fallback-url "
-        "(or POLYGON_RPC_URL / POLYGON_RPC_FALLBACK_URLS)."
+        "failed to connect to any RPC URL. Set --rpc-url/--rpc-fallback-url, "
+        "or check proxy settings with --rpc-no-proxy / --rpc-http-proxy / --rpc-https-proxy "
+        "(env: POLYGON_RPC_URL / POLYGON_RPC_FALLBACK_URLS / POLYGON_RPC_HTTP_PROXY / POLYGON_RPC_HTTPS_PROXY)."
         f"{err_details}"
     )
 
