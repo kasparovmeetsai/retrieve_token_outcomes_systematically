@@ -100,6 +100,11 @@ def _split_csv_urls(raw: str | None) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _default_condition_ids_from_env() -> list[str]:
+    raw = os.getenv("POLYMARKET_CONDITION_IDS", "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Redeem resolved Polymarket outcomes through ConditionalTokens.redeemPositions"
@@ -157,15 +162,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--condition-id",
         action="append",
-        default=[],
-        help="Condition ID to redeem (bytes32 hex). Repeat for multiple.",
+        default=_default_condition_ids_from_env(),
+        help=(
+            "Condition ID to redeem (bytes32 hex). Repeat for multiple. "
+            "Also supports POLYMARKET_CONDITION_IDS as CSV."
+        ),
     )
     parser.add_argument(
         "--conditions-file",
+        default=os.getenv("POLYMARKET_CONDITIONS_FILE"),
         help=(
             "Optional JSON file with entries like "
             "[{\"condition_id\":\"0x..\",\"index_sets\":[1,2]}]. "
-            "If index_sets is omitted, all outcomes are redeemed for that condition."
+            "If index_sets is omitted, all outcomes are redeemed for that condition. "
+            "Also supports POLYMARKET_CONDITIONS_FILE."
         ),
     )
     parser.add_argument(
@@ -315,7 +325,13 @@ def load_condition_requests(args: argparse.Namespace, ctf: Contract) -> list[Con
             requests.append(ConditionRedeemRequest(condition_id=condition_bytes, index_sets=index_sets))
 
     if not requests:
-        raise ValueError("No conditions provided. Use --condition-id and/or --conditions-file")
+        raise ValueError(
+            "No conditions provided. Use one of:\n"
+            "  1) --condition-id 0x... (repeatable)\n"
+            "  2) --conditions-file conditions.json\n"
+            "  3) POLYMARKET_CONDITION_IDS=0x...,0x...\n"
+            "  4) POLYMARKET_CONDITIONS_FILE=conditions.json"
+        )
 
     return _dedupe_requests(requests)
 

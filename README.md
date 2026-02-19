@@ -41,6 +41,31 @@ python claim_polymarket_outcomes.py --conditions-file conditions.json
 
 If `index_sets` is omitted, the script will auto-redeem all outcomes for that condition based on `getOutcomeSlotCount`.
 
+## If you see: "No conditions provided"
+
+That error means the script started correctly, but you didn't pass any condition IDs to claim.
+
+Use one of these:
+
+```bash
+# A) pass one or more condition IDs directly
+python claim_polymarket_outcomes.py \
+  --condition-id 0xCONDITION_ID_1 \
+  --condition-id 0xCONDITION_ID_2 \
+  --dry-run
+
+# B) pass a JSON file
+python claim_polymarket_outcomes.py --conditions-file conditions.json --dry-run
+```
+
+You can also set env vars (useful in IDE run configs):
+
+```bash
+export POLYMARKET_CONDITION_IDS=0xCONDITION_ID_1,0xCONDITION_ID_2
+# OR
+export POLYMARKET_CONDITIONS_FILE=conditions.json
+```
+
 ## About defaults (important)
 
 Built-in addresses are **convenience presets**, not permanent guarantees.
