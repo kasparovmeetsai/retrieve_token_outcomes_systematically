@@ -1,6 +1,6 @@
 # Polymarket outcome claim script
 
-This repository contains a Python script that redeems resolved Polymarket outcome tokens back into collateral (USDC) via the Conditional Tokens contract.
+Redeems resolved Polymarket outcomes back to collateral through Conditional Tokens.
 
 ## Setup
 
@@ -10,144 +10,84 @@ source .venv/bin/activate
 pip install web3
 ```
 
-## Usage
-
-Set your private key in an environment variable:
+## Fast path (auto discover last ETH 5m markets)
 
 ```bash
 export POLYMARKET_PRIVATE_KEY=0xYOUR_PRIVATE_KEY
-```
-
-### Fast path (auto-discover last ETH 5m conditions)
-
-If you pass no condition IDs, the script now auto-builds the last 12 5-minute slugs and calls Gamma API to find `conditionId` values:
-
-- slugs like `eth-updown-5m-<timestamp>`
-- timestamps are floor-to-5m and go back 12 intervals (~1 hour)
-
-```bash
 python claim_polymarket_outcomes.py --dry-run
 ```
 
-### Manual condition input (still supported)
+If no conditions are passed, the script builds slugs like `eth-updown-5m-<timestamp>` for the latest 12 five-minute markets and looks up `conditionId` from Gamma API.
 
-Dry run with one condition:
+## Common SSL error and fix
 
-```bash
-python claim_polymarket_outcomes.py \
-  --condition-id 0x<32-byte-condition-id> \
-  --dry-run
-```
+If you see:
 
-Send transactions for multiple conditions in a JSON file:
+`SSL: CERTIFICATE_VERIFY_FAILED ... unable to get local issuer certificate`
 
-```json
-[
-  {"condition_id": "0xabc...", "index_sets": [1, 2]},
-  {"condition_id": "0xdef..."}
-]
-```
+it means your Python runtime does not trust the certificate chain in your current VPN/proxy environment.
 
-```bash
-python claim_polymarket_outcomes.py --conditions-file conditions.json
-```
+### Preferred fix (secure): provide CA bundle
 
-If `index_sets` is omitted, the script will auto-redeem all outcomes for that condition based on `getOutcomeSlotCount`.
-
-## Auto Gamma options
+1. Obtain your CA bundle PEM (corporate/VPN cert chain or certifi bundle).
+2. Run:
 
 ```bash
 python claim_polymarket_outcomes.py \
-  --auto-eth-5m-count 12 \
-  --auto-eth-5m-prefix eth-updown-5m \
-  --gamma-api-url https://gamma-api.polymarket.com/markets \
+  --gamma-ca-bundle /absolute/path/to/cacert.pem \
   --dry-run
 ```
 
-Disable auto Gamma behavior if you only want explicit inputs:
+or environment variable:
 
 ```bash
-python claim_polymarket_outcomes.py --disable-auto-gamma --condition-id 0x... --dry-run
+export POLYMARKET_GAMMA_CA_BUNDLE=/absolute/path/to/cacert.pem
+python claim_polymarket_outcomes.py --dry-run
 ```
 
-## About defaults (important)
-
-Built-in addresses are **convenience presets**, not permanent guarantees.
-
-- The script auto-detects chain ID from your RPC.
-- If the chain has a known preset (currently Polygon mainnet), that preset is used.
-- If not, you **must** provide addresses via flags/env vars.
-- The script validates that contract bytecode exists at both addresses before running.
-
-Override addresses if needed:
+### Last resort (less secure): skip Gamma TLS verification
 
 ```bash
-export POLYMARKET_CTF_ADDRESS=0x...
-export POLYMARKET_COLLATERAL_TOKEN=0x...
+python claim_polymarket_outcomes.py --gamma-insecure-skip-verify --dry-run
+```
+
+or:
+
+```bash
+export POLYMARKET_GAMMA_INSECURE=1
+python claim_polymarket_outcomes.py --dry-run
+```
+
+Use this only temporarily.
+
+## PyCharm step-by-step (for the SSL case)
+
+1. **Run > Edit Configurations...**
+2. Select `claim_polymarket_outcomes.py`.
+3. In **Script parameters**, add one of:
+   - `--gamma-ca-bundle /absolute/path/to/cacert.pem --dry-run`
+   - or `--gamma-insecure-skip-verify --dry-run` (temporary fallback)
+4. In **Environment variables**, set at least:
+   - `POLYMARKET_PRIVATE_KEY=0xYOUR_PRIVATE_KEY`
+5. Apply and run.
+
+## Manual condition input still supported
+
+```bash
+python claim_polymarket_outcomes.py --condition-id 0x... --dry-run
 python claim_polymarket_outcomes.py --conditions-file conditions.json --dry-run
 ```
 
-Or via CLI:
+## Useful options
 
-```bash
-python claim_polymarket_outcomes.py \
-  --ctf-address 0x... \
-  --collateral-token 0x... \
-  --condition-id 0x... \
-  --dry-run
-```
-
-## RPC connectivity troubleshooting
-
-If you get `ERROR: failed to connect to any RPC URL`, the machine running the script cannot reach Polygon RPC endpoints (endpoint down, network block, proxy issue, or timeout).
-
-The script tries endpoints in order:
-
-1. `--rpc-url` (or `POLYGON_RPC_URL`)
-2. Any `--rpc-fallback-url` values
-3. Any `POLYGON_RPC_FALLBACK_URLS` CSV values
-4. Built-in public fallbacks
-
-### Option A: Use your own RPC provider
-
-Use a private provider URL (Alchemy, QuickNode, Chainstack, etc.):
-
-```bash
-python claim_polymarket_outcomes.py \
-  --rpc-url "https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY" \
-  --dry-run
-```
-
-### Option B: Force no proxy
-
-If your machine has `HTTP_PROXY`/`HTTPS_PROXY` env vars and they are blocking requests:
-
-```bash
-python claim_polymarket_outcomes.py --rpc-no-proxy --dry-run
-```
-
-### Option C: Set an explicit proxy for RPC
-
-```bash
-python claim_polymarket_outcomes.py \
-  --rpc-http-proxy http://127.0.0.1:7890 \
-  --rpc-https-proxy http://127.0.0.1:7890 \
-  --dry-run
-```
-
-(Equivalent env vars: `POLYGON_RPC_HTTP_PROXY`, `POLYGON_RPC_HTTPS_PROXY`.)
-
-### Option D: Add more fallbacks and increase timeout
-
-```bash
-python claim_polymarket_outcomes.py \
-  --rpc-fallback-url https://polygon-bor-rpc.publicnode.com \
-  --rpc-fallback-url https://polygon.drpc.org \
-  --rpc-timeout-seconds 20 \
-  --dry-run
-```
+- `--disable-auto-gamma`
+- `--auto-eth-5m-count 12`
+- `--auto-eth-5m-prefix eth-updown-5m`
+- `--gamma-api-url https://gamma-api.polymarket.com/markets`
+- `--rpc-no-proxy`
+- `--rpc-http-proxy ... --rpc-https-proxy ...`
 
 ## Notes
 
-- Only resolved conditions are redeemed (`payoutDenominator > 0`).
-- Always run `--dry-run` first when testing a new condition list.
+- Default chain preset is Polygon mainnet.
+- Always test with `--dry-run` first.

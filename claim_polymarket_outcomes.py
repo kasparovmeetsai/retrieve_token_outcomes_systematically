@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
-"""Redeem resolved Polymarket outcome tokens back to collateral.
-
-This script calls `redeemPositions` on the Conditional Tokens Framework (CTF)
-contract used by Polymarket. It can process many conditions in one run,
-allowing you to quickly claim collateral after markets resolve.
-"""
+"""Redeem resolved Polymarket outcome tokens back to collateral."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import ssl
 import sys
 import time
 from dataclasses import dataclass
@@ -34,13 +30,11 @@ FALLBACK_RPC_URLS = [
     "https://polygon.drpc.org",
 ]
 
-# These are known-good presets at the time this script was written.
-# You can always override with flags/environment if Polymarket updates addresses.
 KNOWN_NETWORK_DEFAULTS: dict[int, dict[str, str]] = {
     137: {
         "name": "polygon-mainnet",
         "ctf": "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
-        "collateral": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",  # USDC.e
+        "collateral": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
     }
 }
 
@@ -88,6 +82,10 @@ class ResolvedConfig:
     collateral_token: str
 
 
+def _env_bool(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _ensure_0x_hex(raw: str, expected_bytes: int, label: str) -> str:
     raw = raw.strip()
     if not raw.startswith("0x"):
@@ -123,146 +121,54 @@ def slug_for_ts(ts: int, slug_prefix: str) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Redeem resolved Polymarket outcomes through ConditionalTokens.redeemPositions"
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rpc-url", default=os.getenv("POLYGON_RPC_URL", DEFAULT_RPC_URL))
+    parser.add_argument("--rpc-fallback-url", action="append", default=_split_csv_urls(os.getenv("POLYGON_RPC_FALLBACK_URLS")))
+    parser.add_argument("--rpc-timeout-seconds", type=int, default=12)
+    parser.add_argument("--rpc-http-proxy", default=os.getenv("POLYGON_RPC_HTTP_PROXY"))
+    parser.add_argument("--rpc-https-proxy", default=os.getenv("POLYGON_RPC_HTTPS_PROXY"))
+    parser.add_argument("--rpc-no-proxy", action="store_true")
+
+    parser.add_argument("--gamma-api-url", default=os.getenv("POLYMARKET_GAMMA_API_URL", DEFAULT_GAMMA_API_URL))
+    parser.add_argument("--gamma-ca-bundle", default=os.getenv("POLYMARKET_GAMMA_CA_BUNDLE"), help="Path to CA bundle PEM for Gamma HTTPS verification")
     parser.add_argument(
-        "--rpc-url",
-        default=os.getenv("POLYGON_RPC_URL", DEFAULT_RPC_URL),
-        help="Primary Polygon RPC URL (default: %(default)s or POLYGON_RPC_URL env)",
-    )
-    parser.add_argument(
-        "--rpc-fallback-url",
-        action="append",
-        default=_split_csv_urls(os.getenv("POLYGON_RPC_FALLBACK_URLS")),
-        help=(
-            "Fallback RPC URL if primary fails. Repeat flag for multiple values "
-            "or use POLYGON_RPC_FALLBACK_URLS as CSV."
-        ),
-    )
-    parser.add_argument(
-        "--rpc-timeout-seconds",
-        type=int,
-        default=12,
-        help="HTTP timeout per RPC endpoint test (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--rpc-http-proxy",
-        default=os.getenv("POLYGON_RPC_HTTP_PROXY"),
-        help="Optional HTTP proxy URL for RPC calls (or POLYGON_RPC_HTTP_PROXY)",
-    )
-    parser.add_argument(
-        "--rpc-https-proxy",
-        default=os.getenv("POLYGON_RPC_HTTPS_PROXY"),
-        help="Optional HTTPS proxy URL for RPC calls (or POLYGON_RPC_HTTPS_PROXY)",
-    )
-    parser.add_argument(
-        "--rpc-no-proxy",
+        "--gamma-insecure-skip-verify",
         action="store_true",
-        help="Disable proxies for RPC calls, even if HTTP(S)_PROXY is set in your environment.",
+        default=_env_bool("POLYMARKET_GAMMA_INSECURE"),
+        help="Skip TLS verification for Gamma API (last resort only)",
     )
-    parser.add_argument(
-        "--gamma-api-url",
-        default=os.getenv("POLYMARKET_GAMMA_API_URL", DEFAULT_GAMMA_API_URL),
-        help="Gamma markets API URL for slug->condition lookup (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--auto-eth-5m-count",
-        type=int,
-        default=int(os.getenv("POLYMARKET_AUTO_ETH_5M_COUNT", DEFAULT_AUTO_ETH_5M_COUNT)),
-        help="Number of latest 5m ETH markets to scan when auto-fetching (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--auto-eth-5m-prefix",
-        default=os.getenv("POLYMARKET_AUTO_ETH_5M_PREFIX", DEFAULT_AUTO_ETH_5M_PREFIX),
-        help="Slug prefix used to build market slugs (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--disable-auto-gamma",
-        action="store_true",
-        help="Disable automatic condition discovery via Gamma API when no conditions were supplied.",
-    )
-    parser.add_argument(
-        "--private-key",
-        default=os.getenv("POLYMARKET_PRIVATE_KEY"),
-        help="Wallet private key (or set POLYMARKET_PRIVATE_KEY)",
-    )
-    parser.add_argument(
-        "--ctf-address",
-        default=os.getenv("POLYMARKET_CTF_ADDRESS"),
-        help="Conditional Tokens contract address (or set POLYMARKET_CTF_ADDRESS)",
-    )
-    parser.add_argument(
-        "--collateral-token",
-        default=os.getenv("POLYMARKET_COLLATERAL_TOKEN"),
-        help="Collateral token address (or set POLYMARKET_COLLATERAL_TOKEN)",
-    )
-    parser.add_argument(
-        "--condition-id",
-        action="append",
-        default=_default_condition_ids_from_env(),
-        help=(
-            "Condition ID to redeem (bytes32 hex). Repeat for multiple. "
-            "Also supports POLYMARKET_CONDITION_IDS as CSV."
-        ),
-    )
-    parser.add_argument(
-        "--conditions-file",
-        default=os.getenv("POLYMARKET_CONDITIONS_FILE"),
-        help=(
-            "Optional JSON file with entries like "
-            "[{\"condition_id\":\"0x..\",\"index_sets\":[1,2]}]. "
-            "If index_sets is omitted, all outcomes are redeemed for that condition. "
-            "Also supports POLYMARKET_CONDITIONS_FILE."
-        ),
-    )
-    parser.add_argument(
-        "--gas-multiplier",
-        type=float,
-        default=1.20,
-        help="Multiplier applied to estimated gas (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--chain-id",
-        type=int,
-        help=(
-            "Chain ID for signing. If omitted, uses connected RPC chain. "
-            "If provided, it must match the RPC chain."
-        ),
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be redeemed without sending transactions.",
-    )
+    parser.add_argument("--auto-eth-5m-count", type=int, default=int(os.getenv("POLYMARKET_AUTO_ETH_5M_COUNT", DEFAULT_AUTO_ETH_5M_COUNT)))
+    parser.add_argument("--auto-eth-5m-prefix", default=os.getenv("POLYMARKET_AUTO_ETH_5M_PREFIX", DEFAULT_AUTO_ETH_5M_PREFIX))
+    parser.add_argument("--disable-auto-gamma", action="store_true")
+
+    parser.add_argument("--private-key", default=os.getenv("POLYMARKET_PRIVATE_KEY"))
+    parser.add_argument("--ctf-address", default=os.getenv("POLYMARKET_CTF_ADDRESS"))
+    parser.add_argument("--collateral-token", default=os.getenv("POLYMARKET_COLLATERAL_TOKEN"))
+    parser.add_argument("--condition-id", action="append", default=_default_condition_ids_from_env())
+    parser.add_argument("--conditions-file", default=os.getenv("POLYMARKET_CONDITIONS_FILE"))
+    parser.add_argument("--gas-multiplier", type=float, default=1.20)
+    parser.add_argument("--chain-id", type=int)
+    parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
 
 def _build_rpc_request_kwargs(args: argparse.Namespace) -> dict:
     request_kwargs: dict = {"timeout": args.rpc_timeout_seconds}
-
     if args.rpc_no_proxy:
         request_kwargs["proxies"] = {"http": "", "https": ""}
     elif args.rpc_http_proxy or args.rpc_https_proxy:
-        request_kwargs["proxies"] = {
-            "http": args.rpc_http_proxy or "",
-            "https": args.rpc_https_proxy or args.rpc_http_proxy or "",
-        }
-
+        request_kwargs["proxies"] = {"http": args.rpc_http_proxy or "", "https": args.rpc_https_proxy or args.rpc_http_proxy or ""}
     return request_kwargs
 
 
 def _connect_web3(args: argparse.Namespace) -> tuple[Web3, str]:
     rpc_candidates = [args.rpc_url, *args.rpc_fallback_url, *FALLBACK_RPC_URLS]
-
     deduped_candidates: list[str] = []
     for url in rpc_candidates:
         if url and url not in deduped_candidates:
             deduped_candidates.append(url)
-
     request_kwargs = _build_rpc_request_kwargs(args)
     errors: list[str] = []
-
     for url in deduped_candidates:
         try:
             w3 = Web3(Web3.HTTPProvider(url, request_kwargs=request_kwargs))
@@ -272,111 +178,91 @@ def _connect_web3(args: argparse.Namespace) -> tuple[Web3, str]:
             errors.append(f"{url} -> chain_id unavailable")
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{url} -> {exc}")
-
-    err_details = "\n  - " + "\n  - ".join(errors) if errors else ""
-    raise ConnectionError(
-        "failed to connect to any RPC URL. Set --rpc-url/--rpc-fallback-url, "
-        "or check proxy settings with --rpc-no-proxy / --rpc-http-proxy / --rpc-https-proxy "
-        "(env: POLYGON_RPC_URL / POLYGON_RPC_FALLBACK_URLS / POLYGON_RPC_HTTP_PROXY / POLYGON_RPC_HTTPS_PROXY)."
-        f"{err_details}"
-    )
+    raise ConnectionError("failed to connect to any RPC URL.\n  - " + "\n  - ".join(errors))
 
 
 def resolve_config(args: argparse.Namespace, w3: Web3) -> ResolvedConfig:
     rpc_chain_id = w3.eth.chain_id
     chain_id = args.chain_id if args.chain_id is not None else rpc_chain_id
     if chain_id != rpc_chain_id:
-        raise ValueError(
-            f"--chain-id ({chain_id}) does not match RPC chain ({rpc_chain_id}). "
-            "Use the correct RPC or remove --chain-id."
-        )
+        raise ValueError(f"--chain-id ({chain_id}) does not match RPC chain ({rpc_chain_id}).")
 
     network_defaults = KNOWN_NETWORK_DEFAULTS.get(chain_id)
     chain_name = network_defaults["name"] if network_defaults else f"chain-{chain_id}"
-
     ctf_raw = args.ctf_address or (network_defaults["ctf"] if network_defaults else None)
     collateral_raw = args.collateral_token or (network_defaults["collateral"] if network_defaults else None)
-
     if not ctf_raw or not collateral_raw:
-        raise ValueError(
-            f"No built-in defaults for chain {chain_id}. Provide --ctf-address and --collateral-token "
-            "(or POLYMARKET_CTF_ADDRESS / POLYMARKET_COLLATERAL_TOKEN)."
-        )
+        raise ValueError(f"No built-in defaults for chain {chain_id}. Provide --ctf-address and --collateral-token.")
 
     ctf_address = Web3.to_checksum_address(ctf_raw)
     collateral_token = Web3.to_checksum_address(collateral_raw)
-
-    ctf_code = w3.eth.get_code(ctf_address)
-    collateral_code = w3.eth.get_code(collateral_token)
-    if len(ctf_code) == 0:
+    if len(w3.eth.get_code(ctf_address)) == 0:
         raise ValueError(f"No contract code found at CTF address {ctf_address} on chain {chain_id}")
-    if len(collateral_code) == 0:
+    if len(w3.eth.get_code(collateral_token)) == 0:
         raise ValueError(f"No contract code found at collateral token address {collateral_token} on chain {chain_id}")
 
-    return ResolvedConfig(
-        chain_id=chain_id,
-        chain_name=chain_name,
-        ctf_address=ctf_address,
-        collateral_token=collateral_token,
-    )
+    return ResolvedConfig(chain_id=chain_id, chain_name=chain_name, ctf_address=ctf_address, collateral_token=collateral_token)
+
+
+def _build_gamma_ssl_context(args: argparse.Namespace) -> ssl.SSLContext:
+    if args.gamma_insecure_skip_verify:
+        return ssl._create_unverified_context()
+    if args.gamma_ca_bundle:
+        return ssl.create_default_context(cafile=args.gamma_ca_bundle)
+    return ssl.create_default_context()
 
 
 def _extract_condition_ids(markets_json: object) -> list[str]:
     items = markets_json if isinstance(markets_json, list) else [markets_json]
-    condition_ids: list[str] = []
-
+    out: list[str] = []
     for item in items:
-        if not isinstance(item, dict):
-            continue
-        candidate = item.get("conditionId") or item.get("condition_id")
-        if isinstance(candidate, str) and candidate:
-            condition_ids.append(candidate)
-
-    return condition_ids
+        if isinstance(item, dict):
+            candidate = item.get("conditionId") or item.get("condition_id")
+            if isinstance(candidate, str) and candidate:
+                out.append(candidate)
+    return out
 
 
 def _fetch_condition_ids_for_slug(args: argparse.Namespace, slug: str) -> list[str]:
     query = urlencode({"slug": slug})
     url = f"{args.gamma_api_url}?{query}"
+    ssl_context = _build_gamma_ssl_context(args)
 
     try:
-        with urlopen(url, timeout=args.rpc_timeout_seconds) as response:
+        with urlopen(url, timeout=args.rpc_timeout_seconds, context=ssl_context) as response:
             payload = response.read().decode("utf-8")
     except URLError as exc:
-        raise ValueError(f"Gamma API request failed for slug={slug}: {exc}") from exc
+        extra = ""
+        if isinstance(getattr(exc, "reason", None), ssl.SSLCertVerificationError):
+            extra = (
+                " (TLS verify failed. Fix CA chain on your machine or use --gamma-ca-bundle / "
+                "POLYMARKET_GAMMA_CA_BUNDLE. Last resort: --gamma-insecure-skip-verify)"
+            )
+        raise ValueError(f"Gamma API request failed for slug={slug}: {exc}{extra}") from exc
 
     try:
         parsed = json.loads(payload)
     except json.JSONDecodeError as exc:
         raise ValueError(f"Gamma API returned invalid JSON for slug={slug}") from exc
-
     return _extract_condition_ids(parsed)
 
 
 def _auto_fetch_eth_5m_condition_ids(args: argparse.Namespace) -> list[str]:
     if args.auto_eth_5m_count <= 0:
         return []
-
     now_rounded = floor_to_5m()
     found: list[str] = []
-
     for i in range(args.auto_eth_5m_count):
-        ts = now_rounded - (i * 300)
-        slug = slug_for_ts(ts, args.auto_eth_5m_prefix)
+        slug = slug_for_ts(now_rounded - (i * 300), args.auto_eth_5m_prefix)
         try:
-            slug_condition_ids = _fetch_condition_ids_for_slug(args, slug)
+            found.extend(_fetch_condition_ids_for_slug(args, slug))
         except ValueError as exc:
             print(f"WARN: {exc}", file=sys.stderr)
             continue
-
-        if slug_condition_ids:
-            print(f"Auto-discovered slug={slug} -> {len(slug_condition_ids)} condition(s)")
-        found.extend(slug_condition_ids)
-
     deduped: list[str] = []
-    for condition_id in found:
-        if condition_id not in deduped:
-            deduped.append(condition_id)
+    for c in found:
+        if c not in deduped:
+            deduped.append(c)
     return deduped
 
 
@@ -384,62 +270,34 @@ def load_condition_requests(args: argparse.Namespace, ctf: Contract) -> list[Con
     requests: list[ConditionRedeemRequest] = []
 
     for condition_id in args.condition_id:
-        condition_hex = _ensure_0x_hex(condition_id, 32, "condition_id")
-        condition_bytes = Web3.to_bytes(hexstr=condition_hex)
-        requests.append(
-            ConditionRedeemRequest(
-                condition_id=condition_bytes,
-                index_sets=_all_index_sets_for_condition(ctf, condition_bytes),
-            )
-        )
+        condition_bytes = Web3.to_bytes(hexstr=_ensure_0x_hex(condition_id, 32, "condition_id"))
+        requests.append(ConditionRedeemRequest(condition_id=condition_bytes, index_sets=_all_index_sets_for_condition(ctf, condition_bytes)))
 
     if args.conditions_file:
         with open(args.conditions_file, "r", encoding="utf-8") as f:
             raw_entries = json.load(f)
-
         if not isinstance(raw_entries, list):
             raise ValueError("conditions-file must be a JSON array")
-
         for entry in raw_entries:
             if not isinstance(entry, dict) or "condition_id" not in entry:
                 raise ValueError("each condition entry must be an object with condition_id")
-
-            condition_hex = _ensure_0x_hex(str(entry["condition_id"]), 32, "condition_id")
-            condition_bytes = Web3.to_bytes(hexstr=condition_hex)
-
+            condition_bytes = Web3.to_bytes(hexstr=_ensure_0x_hex(str(entry["condition_id"]), 32, "condition_id"))
             raw_index_sets = entry.get("index_sets")
             if raw_index_sets is None:
                 index_sets = _all_index_sets_for_condition(ctf, condition_bytes)
             else:
-                if not isinstance(raw_index_sets, list) or not all(
-                    isinstance(x, int) and x > 0 for x in raw_index_sets
-                ):
+                if not isinstance(raw_index_sets, list) or not all(isinstance(x, int) and x > 0 for x in raw_index_sets):
                     raise ValueError("index_sets must be a list of positive integers")
                 index_sets = raw_index_sets
-
             requests.append(ConditionRedeemRequest(condition_id=condition_bytes, index_sets=index_sets))
 
     if not requests and not args.disable_auto_gamma:
-        auto_condition_ids = _auto_fetch_eth_5m_condition_ids(args)
-        for condition_id in auto_condition_ids:
-            condition_hex = _ensure_0x_hex(condition_id, 32, "condition_id")
-            condition_bytes = Web3.to_bytes(hexstr=condition_hex)
-            requests.append(
-                ConditionRedeemRequest(
-                    condition_id=condition_bytes,
-                    index_sets=_all_index_sets_for_condition(ctf, condition_bytes),
-                )
-            )
+        for condition_id in _auto_fetch_eth_5m_condition_ids(args):
+            condition_bytes = Web3.to_bytes(hexstr=_ensure_0x_hex(condition_id, 32, "condition_id"))
+            requests.append(ConditionRedeemRequest(condition_id=condition_bytes, index_sets=_all_index_sets_for_condition(ctf, condition_bytes)))
 
     if not requests:
-        raise ValueError(
-            "No conditions provided or discovered. Use one of:\n"
-            "  1) --condition-id 0x... (repeatable)\n"
-            "  2) --conditions-file conditions.json\n"
-            "  3) POLYMARKET_CONDITION_IDS=0x...,0x...\n"
-            "  4) POLYMARKET_CONDITIONS_FILE=conditions.json\n"
-            "  5) allow auto-discovery from Gamma API (default behavior when inputs are empty)"
-        )
+        raise ValueError("No conditions provided or discovered.")
 
     return _dedupe_requests(requests)
 
@@ -447,9 +305,7 @@ def load_condition_requests(args: argparse.Namespace, ctf: Contract) -> list[Con
 def _all_index_sets_for_condition(ctf: Contract, condition_id: bytes) -> list[int]:
     slot_count = ctf.functions.getOutcomeSlotCount(condition_id).call()
     if slot_count <= 0:
-        raise ValueError(
-            f"Condition {Web3.to_hex(condition_id)} has zero outcome slots. Verify the condition ID."
-        )
+        raise ValueError(f"Condition {Web3.to_hex(condition_id)} has zero outcome slots. Verify the condition ID.")
     return [1 << i for i in range(slot_count)]
 
 
@@ -457,11 +313,7 @@ def _dedupe_requests(requests: Sequence[ConditionRedeemRequest]) -> list[Conditi
     merged: dict[bytes, set[int]] = {}
     for req in requests:
         merged.setdefault(req.condition_id, set()).update(req.index_sets)
-
-    return [
-        ConditionRedeemRequest(condition_id=condition_id, index_sets=sorted(index_sets))
-        for condition_id, index_sets in merged.items()
-    ]
+    return [ConditionRedeemRequest(condition_id=k, index_sets=sorted(v)) for k, v in merged.items()]
 
 
 def _format_index_sets(index_sets: Iterable[int]) -> str:
@@ -470,27 +322,19 @@ def _format_index_sets(index_sets: Iterable[int]) -> str:
 
 def main() -> int:
     args = parse_args()
-
     if not args.private_key:
         print("ERROR: private key is required via --private-key or POLYMARKET_PRIVATE_KEY", file=sys.stderr)
         return 1
 
     try:
         w3, selected_rpc_url = _connect_web3(args)
-    except Exception as exc:  # noqa: BLE001
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
-
-    try:
         config = resolve_config(args, w3)
     except Exception as exc:  # noqa: BLE001
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
     ctf = w3.eth.contract(address=config.ctf_address, abi=CTF_ABI)
-
-    account = w3.eth.account.from_key(args.private_key)
-    owner = account.address
+    owner = w3.eth.account.from_key(args.private_key).address
 
     try:
         requests = load_condition_requests(args, ctf)
@@ -504,43 +348,28 @@ def main() -> int:
     print(f"CTF:            {config.ctf_address}")
     print(f"Collateral:     {config.collateral_token}")
     print(f"Conditions:     {len(requests)}")
-
     if args.dry_run:
         print("Mode:           DRY RUN (no tx sent)")
 
     nonce = w3.eth.get_transaction_count(owner)
     sent = 0
     skipped = 0
-
     for idx, req in enumerate(requests, start=1):
         condition_hex = Web3.to_hex(req.condition_id)
         payout_denominator = ctf.functions.payoutDenominator(req.condition_id).call()
-
         if payout_denominator == 0:
             print(f"[{idx}/{len(requests)}] SKIP unresolved condition {condition_hex}")
             skipped += 1
             continue
 
-        fn = ctf.functions.redeemPositions(
-            config.collateral_token,
-            b"\x00" * 32,
-            req.condition_id,
-            req.index_sets,
-        )
-
+        fn = ctf.functions.redeemPositions(config.collateral_token, b"\x00" * 32, req.condition_id, req.index_sets)
         try:
-            estimated_gas = fn.estimate_gas({"from": owner})
+            gas_limit = int(fn.estimate_gas({"from": owner}) * args.gas_multiplier)
         except Exception as exc:  # noqa: BLE001
             print(f"[{idx}/{len(requests)}] ERROR estimating gas for {condition_hex}: {exc}")
             continue
 
-        gas_limit = int(estimated_gas * args.gas_multiplier)
-
-        print(
-            f"[{idx}/{len(requests)}] Redeem {condition_hex} index_sets={_format_index_sets(req.index_sets)} "
-            f"payout_denom={payout_denominator} gas~{gas_limit}"
-        )
-
+        print(f"[{idx}/{len(requests)}] Redeem {condition_hex} index_sets={_format_index_sets(req.index_sets)} payout_denom={payout_denominator} gas~{gas_limit}")
         if args.dry_run:
             continue
 
@@ -554,13 +383,11 @@ def main() -> int:
                 "maxPriorityFeePerGas": w3.eth.max_priority_fee,
             }
         )
-
         signed = w3.eth.account.sign_transaction(tx, private_key=args.private_key)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
         print(f"    -> sent tx: {tx_hash.hex()}")
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
         print(f"    -> mined status={receipt.status} block={receipt.blockNumber}")
-
         nonce += 1
         sent += 1
 
