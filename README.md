@@ -18,6 +18,19 @@ Set your private key in an environment variable:
 export POLYMARKET_PRIVATE_KEY=0xYOUR_PRIVATE_KEY
 ```
 
+### Fast path (auto-discover last ETH 5m conditions)
+
+If you pass no condition IDs, the script now auto-builds the last 12 5-minute slugs and calls Gamma API to find `conditionId` values:
+
+- slugs like `eth-updown-5m-<timestamp>`
+- timestamps are floor-to-5m and go back 12 intervals (~1 hour)
+
+```bash
+python claim_polymarket_outcomes.py --dry-run
+```
+
+### Manual condition input (still supported)
+
 Dry run with one condition:
 
 ```bash
@@ -41,29 +54,20 @@ python claim_polymarket_outcomes.py --conditions-file conditions.json
 
 If `index_sets` is omitted, the script will auto-redeem all outcomes for that condition based on `getOutcomeSlotCount`.
 
-## If you see: "No conditions provided"
-
-That error means the script started correctly, but you didn't pass any condition IDs to claim.
-
-Use one of these:
+## Auto Gamma options
 
 ```bash
-# A) pass one or more condition IDs directly
 python claim_polymarket_outcomes.py \
-  --condition-id 0xCONDITION_ID_1 \
-  --condition-id 0xCONDITION_ID_2 \
+  --auto-eth-5m-count 12 \
+  --auto-eth-5m-prefix eth-updown-5m \
+  --gamma-api-url https://gamma-api.polymarket.com/markets \
   --dry-run
-
-# B) pass a JSON file
-python claim_polymarket_outcomes.py --conditions-file conditions.json --dry-run
 ```
 
-You can also set env vars (useful in IDE run configs):
+Disable auto Gamma behavior if you only want explicit inputs:
 
 ```bash
-export POLYMARKET_CONDITION_IDS=0xCONDITION_ID_1,0xCONDITION_ID_2
-# OR
-export POLYMARKET_CONDITIONS_FILE=conditions.json
+python claim_polymarket_outcomes.py --disable-auto-gamma --condition-id 0x... --dry-run
 ```
 
 ## About defaults (important)
@@ -111,7 +115,6 @@ Use a private provider URL (Alchemy, QuickNode, Chainstack, etc.):
 ```bash
 python claim_polymarket_outcomes.py \
   --rpc-url "https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY" \
-  --condition-id 0x... \
   --dry-run
 ```
 
@@ -120,7 +123,7 @@ python claim_polymarket_outcomes.py \
 If your machine has `HTTP_PROXY`/`HTTPS_PROXY` env vars and they are blocking requests:
 
 ```bash
-python claim_polymarket_outcomes.py --rpc-no-proxy --condition-id 0x... --dry-run
+python claim_polymarket_outcomes.py --rpc-no-proxy --dry-run
 ```
 
 ### Option C: Set an explicit proxy for RPC
@@ -129,7 +132,6 @@ python claim_polymarket_outcomes.py --rpc-no-proxy --condition-id 0x... --dry-ru
 python claim_polymarket_outcomes.py \
   --rpc-http-proxy http://127.0.0.1:7890 \
   --rpc-https-proxy http://127.0.0.1:7890 \
-  --condition-id 0x... \
   --dry-run
 ```
 
@@ -142,7 +144,6 @@ python claim_polymarket_outcomes.py \
   --rpc-fallback-url https://polygon-bor-rpc.publicnode.com \
   --rpc-fallback-url https://polygon.drpc.org \
   --rpc-timeout-seconds 20 \
-  --condition-id 0x... \
   --dry-run
 ```
 

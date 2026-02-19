@@ -12,13 +12,20 @@ import argparse
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Iterable, Sequence
+from urllib.error import URLError
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 from web3 import Web3
 from web3.contract import Contract
 
 DEFAULT_RPC_URL = "https://polygon-rpc.com"
+DEFAULT_GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
+DEFAULT_AUTO_ETH_5M_COUNT = 12
+DEFAULT_AUTO_ETH_5M_PREFIX = "eth-updown-5m"
 FALLBACK_RPC_URLS = [
     "https://rpc.ankr.com/polygon",
     "https://polygon.llamarpc.com",
@@ -105,6 +112,16 @@ def _default_condition_ids_from_env() -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def floor_to_5m(ts: float | None = None) -> int:
+    if ts is None:
+        ts = time.time()
+    return int(ts // 300) * 300
+
+
+def slug_for_ts(ts: int, slug_prefix: str) -> str:
+    return f"{slug_prefix}-{ts}"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Redeem resolved Polymarket outcomes through ConditionalTokens.redeemPositions"
@@ -143,6 +160,27 @@ def parse_args() -> argparse.Namespace:
         "--rpc-no-proxy",
         action="store_true",
         help="Disable proxies for RPC calls, even if HTTP(S)_PROXY is set in your environment.",
+    )
+    parser.add_argument(
+        "--gamma-api-url",
+        default=os.getenv("POLYMARKET_GAMMA_API_URL", DEFAULT_GAMMA_API_URL),
+        help="Gamma markets API URL for slug->condition lookup (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--auto-eth-5m-count",
+        type=int,
+        default=int(os.getenv("POLYMARKET_AUTO_ETH_5M_COUNT", DEFAULT_AUTO_ETH_5M_COUNT)),
+        help="Number of latest 5m ETH markets to scan when auto-fetching (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--auto-eth-5m-prefix",
+        default=os.getenv("POLYMARKET_AUTO_ETH_5M_PREFIX", DEFAULT_AUTO_ETH_5M_PREFIX),
+        help="Slug prefix used to build market slugs (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--disable-auto-gamma",
+        action="store_true",
+        help="Disable automatic condition discovery via Gamma API when no conditions were supplied.",
     )
     parser.add_argument(
         "--private-key",
@@ -204,7 +242,6 @@ def _build_rpc_request_kwargs(args: argparse.Namespace) -> dict:
     request_kwargs: dict = {"timeout": args.rpc_timeout_seconds}
 
     if args.rpc_no_proxy:
-        # Explicitly bypass environment proxies.
         request_kwargs["proxies"] = {"http": "", "https": ""}
     elif args.rpc_http_proxy or args.rpc_https_proxy:
         request_kwargs["proxies"] = {
@@ -218,7 +255,6 @@ def _build_rpc_request_kwargs(args: argparse.Namespace) -> dict:
 def _connect_web3(args: argparse.Namespace) -> tuple[Web3, str]:
     rpc_candidates = [args.rpc_url, *args.rpc_fallback_url, *FALLBACK_RPC_URLS]
 
-    # Deduplicate while preserving order.
     deduped_candidates: list[str] = []
     for url in rpc_candidates:
         if url and url not in deduped_candidates:
@@ -285,6 +321,65 @@ def resolve_config(args: argparse.Namespace, w3: Web3) -> ResolvedConfig:
     )
 
 
+def _extract_condition_ids(markets_json: object) -> list[str]:
+    items = markets_json if isinstance(markets_json, list) else [markets_json]
+    condition_ids: list[str] = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        candidate = item.get("conditionId") or item.get("condition_id")
+        if isinstance(candidate, str) and candidate:
+            condition_ids.append(candidate)
+
+    return condition_ids
+
+
+def _fetch_condition_ids_for_slug(args: argparse.Namespace, slug: str) -> list[str]:
+    query = urlencode({"slug": slug})
+    url = f"{args.gamma_api_url}?{query}"
+
+    try:
+        with urlopen(url, timeout=args.rpc_timeout_seconds) as response:
+            payload = response.read().decode("utf-8")
+    except URLError as exc:
+        raise ValueError(f"Gamma API request failed for slug={slug}: {exc}") from exc
+
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Gamma API returned invalid JSON for slug={slug}") from exc
+
+    return _extract_condition_ids(parsed)
+
+
+def _auto_fetch_eth_5m_condition_ids(args: argparse.Namespace) -> list[str]:
+    if args.auto_eth_5m_count <= 0:
+        return []
+
+    now_rounded = floor_to_5m()
+    found: list[str] = []
+
+    for i in range(args.auto_eth_5m_count):
+        ts = now_rounded - (i * 300)
+        slug = slug_for_ts(ts, args.auto_eth_5m_prefix)
+        try:
+            slug_condition_ids = _fetch_condition_ids_for_slug(args, slug)
+        except ValueError as exc:
+            print(f"WARN: {exc}", file=sys.stderr)
+            continue
+
+        if slug_condition_ids:
+            print(f"Auto-discovered slug={slug} -> {len(slug_condition_ids)} condition(s)")
+        found.extend(slug_condition_ids)
+
+    deduped: list[str] = []
+    for condition_id in found:
+        if condition_id not in deduped:
+            deduped.append(condition_id)
+    return deduped
+
+
 def load_condition_requests(args: argparse.Namespace, ctf: Contract) -> list[ConditionRedeemRequest]:
     requests: list[ConditionRedeemRequest] = []
 
@@ -324,13 +419,26 @@ def load_condition_requests(args: argparse.Namespace, ctf: Contract) -> list[Con
 
             requests.append(ConditionRedeemRequest(condition_id=condition_bytes, index_sets=index_sets))
 
+    if not requests and not args.disable_auto_gamma:
+        auto_condition_ids = _auto_fetch_eth_5m_condition_ids(args)
+        for condition_id in auto_condition_ids:
+            condition_hex = _ensure_0x_hex(condition_id, 32, "condition_id")
+            condition_bytes = Web3.to_bytes(hexstr=condition_hex)
+            requests.append(
+                ConditionRedeemRequest(
+                    condition_id=condition_bytes,
+                    index_sets=_all_index_sets_for_condition(ctf, condition_bytes),
+                )
+            )
+
     if not requests:
         raise ValueError(
-            "No conditions provided. Use one of:\n"
+            "No conditions provided or discovered. Use one of:\n"
             "  1) --condition-id 0x... (repeatable)\n"
             "  2) --conditions-file conditions.json\n"
             "  3) POLYMARKET_CONDITION_IDS=0x...,0x...\n"
-            "  4) POLYMARKET_CONDITIONS_FILE=conditions.json"
+            "  4) POLYMARKET_CONDITIONS_FILE=conditions.json\n"
+            "  5) allow auto-discovery from Gamma API (default behavior when inputs are empty)"
         )
 
     return _dedupe_requests(requests)
