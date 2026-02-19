@@ -45,6 +45,18 @@ export POLYMARKET_GAMMA_CA_BUNDLE=/absolute/path/to/cacert.pem
 python claim_polymarket_outcomes.py --dry-run
 ```
 
+### Easy secure fix for many macOS/PyCharm setups: certifi bundle
+
+```bash
+python -m pip install certifi
+python - <<'PY'
+import certifi
+print(certifi.where())
+PY
+```
+
+Copy the printed path and use it as `--gamma-ca-bundle`.
+
 ### Last resort (less secure): skip Gamma TLS verification
 
 ```bash
@@ -65,11 +77,12 @@ Use this only temporarily.
 1. **Run > Edit Configurations...**
 2. Select `claim_polymarket_outcomes.py`.
 3. In **Script parameters**, add one of:
-   - `--gamma-ca-bundle /absolute/path/to/cacert.pem --dry-run`
+   - `--gamma-ca-bundle /absolute/path/to/cacert.pem --dry-run` (preferred)
    - or `--gamma-insecure-skip-verify --dry-run` (temporary fallback)
-4. In **Environment variables**, set at least:
+4. If you do not have a CA bundle path yet, install `certifi`, run `print(certifi.where())`, and paste that path into `--gamma-ca-bundle`.
+5. In **Environment variables**, set at least:
    - `POLYMARKET_PRIVATE_KEY=0xYOUR_PRIVATE_KEY`
-5. Apply and run.
+6. Apply and run.
 
 ## Manual condition input still supported
 

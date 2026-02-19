@@ -204,12 +204,26 @@ def resolve_config(args: argparse.Namespace, w3: Web3) -> ResolvedConfig:
     return ResolvedConfig(chain_id=chain_id, chain_name=chain_name, ctf_address=ctf_address, collateral_token=collateral_token)
 
 
-def _build_gamma_ssl_context(args: argparse.Namespace) -> ssl.SSLContext:
+def _build_gamma_ssl_contexts(args: argparse.Namespace) -> list[tuple[str, ssl.SSLContext]]:
     if args.gamma_insecure_skip_verify:
-        return ssl._create_unverified_context()
+        return [("insecure", ssl._create_unverified_context())]
+
+    contexts: list[tuple[str, ssl.SSLContext]] = []
     if args.gamma_ca_bundle:
-        return ssl.create_default_context(cafile=args.gamma_ca_bundle)
-    return ssl.create_default_context()
+        contexts.append(("user-ca-bundle", ssl.create_default_context(cafile=args.gamma_ca_bundle)))
+    else:
+        contexts.append(("system-ca", ssl.create_default_context()))
+
+        # Automatic fallback: if certifi is available, try its bundle too.
+        try:
+            import certifi  # type: ignore
+
+            certifi_path = certifi.where()
+            contexts.append(("certifi", ssl.create_default_context(cafile=certifi_path)))
+        except Exception:  # noqa: BLE001
+            pass
+
+    return contexts
 
 
 def _extract_condition_ids(markets_json: object) -> list[str]:
@@ -226,25 +240,34 @@ def _extract_condition_ids(markets_json: object) -> list[str]:
 def _fetch_condition_ids_for_slug(args: argparse.Namespace, slug: str) -> list[str]:
     query = urlencode({"slug": slug})
     url = f"{args.gamma_api_url}?{query}"
-    ssl_context = _build_gamma_ssl_context(args)
 
-    try:
-        with urlopen(url, timeout=args.rpc_timeout_seconds, context=ssl_context) as response:
-            payload = response.read().decode("utf-8")
-    except URLError as exc:
-        extra = ""
-        if isinstance(getattr(exc, "reason", None), ssl.SSLCertVerificationError):
-            extra = (
-                " (TLS verify failed. Fix CA chain on your machine or use --gamma-ca-bundle / "
-                "POLYMARKET_GAMMA_CA_BUNDLE. Last resort: --gamma-insecure-skip-verify)"
-            )
-        raise ValueError(f"Gamma API request failed for slug={slug}: {exc}{extra}") from exc
+    attempt_errors: list[str] = []
+    ssl_failed = False
 
-    try:
-        parsed = json.loads(payload)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Gamma API returned invalid JSON for slug={slug}") from exc
-    return _extract_condition_ids(parsed)
+    for context_name, ssl_context in _build_gamma_ssl_contexts(args):
+        try:
+            with urlopen(url, timeout=args.rpc_timeout_seconds, context=ssl_context) as response:
+                payload = response.read().decode("utf-8")
+            parsed = json.loads(payload)
+            return _extract_condition_ids(parsed)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Gamma API returned invalid JSON for slug={slug}") from exc
+        except URLError as exc:
+            if isinstance(getattr(exc, "reason", None), ssl.SSLCertVerificationError):
+                ssl_failed = True
+            attempt_errors.append(f"{context_name}: {exc}")
+            continue
+
+    extra = ""
+    if ssl_failed:
+        extra = (
+            " TLS verify failed. Try one of: "
+            "(1) install certifi and use its CA bundle, "
+            "(2) set --gamma-ca-bundle / POLYMARKET_GAMMA_CA_BUNDLE, "
+            "(3) last resort --gamma-insecure-skip-verify."
+        )
+    details = "; ".join(attempt_errors)
+    raise ValueError(f"Gamma API request failed for slug={slug}: {details}.{extra}")
 
 
 def _auto_fetch_eth_5m_condition_ids(args: argparse.Namespace) -> list[str]:
@@ -297,7 +320,11 @@ def load_condition_requests(args: argparse.Namespace, ctf: Contract) -> list[Con
             requests.append(ConditionRedeemRequest(condition_id=condition_bytes, index_sets=_all_index_sets_for_condition(ctf, condition_bytes)))
 
     if not requests:
-        raise ValueError("No conditions provided or discovered.")
+        raise ValueError(
+            "No conditions provided or discovered. If Gamma auto-discovery failed due to SSL, "
+            "set --gamma-ca-bundle (preferred) or use --gamma-insecure-skip-verify (temporary), "
+            "or pass --condition-id / --conditions-file explicitly."
+        )
 
     return _dedupe_requests(requests)
 
